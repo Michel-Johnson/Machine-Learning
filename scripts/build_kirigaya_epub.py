@@ -827,7 +827,7 @@ def build_book(
     book = epub.EpubBook()
     book.set_identifier(identifier)
     book.set_title(title)
-    book.set_language("zh")
+    book.set_language("zh-CN")
     book.add_author("锦恢")
     book.add_metadata("DC", "source", ORIGIN + "/home")
     book.add_metadata(
@@ -867,7 +867,7 @@ def build_book(
         uid="preface",
         title="关于这本离线书",
         file_name="preface.xhtml",
-        lang="zh",
+        lang="zh-CN",
     )
     preface.content = preface_html(
         volume_label, articles, private_count, failures, image_note, missing_images
@@ -881,7 +881,7 @@ def build_book(
             uid=f"post-{article['seq']}",
             title=article["name"],
             file_name=f"p{article['seq']}.xhtml",
-            lang="zh",
+            lang="zh-CN",
         )
         chapter.content = localize_links(
             chapter_html(article, bodies[article["seq"]]),
@@ -902,13 +902,61 @@ def build_book(
     book.toc = toc
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ["nav", preface, *chapters]
+    # Keep the navigation document out of the reading order. Some readers
+    # otherwise open nav.xhtml as the first chapter and fail to decode it.
+    book.spine = [preface, *chapters]
     return book
+
+
+CHARSET_META = (
+    '<meta charset="utf-8"/>\n'
+    '    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>\n'
+    "    "
+)
+
+
+def declare_utf8(data: bytes) -> bytes:
+    """Chinese readers often ignore the XML encoding declaration and assume GBK."""
+    text = data.decode("utf-8")
+    text = re.sub(
+        r"<\?xml version='1\.0' encoding='utf-8'\?>",
+        '<?xml version="1.0" encoding="utf-8"?>',
+        text,
+        count=1,
+    )
+    text = re.sub(r'\bxml:lang="zh"', 'xml:lang="zh-CN"', text)
+    text = re.sub(r'(?<![:\w])lang="zh"', 'lang="zh-CN"', text)
+    if "charset" not in text[:1200].lower() and "<head>" in text:
+        text = text.replace("<head>", "<head>\n    " + CHARSET_META, 1)
+    return text.encode("utf-8")
+
+
+def finalize_epub(path: Path) -> None:
+    temporary = path.with_suffix(".tmp.epub")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(temporary, "w") as target:
+        mimetype = zipfile.ZipInfo("mimetype")
+        mimetype.compress_type = zipfile.ZIP_STORED
+        target.writestr(mimetype, b"application/epub+zip")
+        for info in source.infolist():
+            if info.filename == "mimetype":
+                continue
+            payload = source.read(info.filename)
+            if info.filename.endswith(".xhtml"):
+                payload = declare_utf8(payload)
+            elif info.filename.endswith("content.opf"):
+                payload = payload.replace(b'<itemref idref="nav"/>', b"")
+                payload = payload.replace(b"<dc:language>zh</dc:language>", b"<dc:language>zh-CN</dc:language>")
+            replacement = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+            replacement.compress_type = zipfile.ZIP_DEFLATED
+            replacement.external_attr = info.external_attr
+            target.writestr(replacement, payload)
+    temporary.replace(path)
 
 
 def write_book(path: Path, book: epub.EpubBook) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     epub.write_epub(str(path), book, {})
+    finalize_epub(path)
 
 
 def article_image_bytes(article_urls: list[str], encoded: dict[str, dict], already: set[str]) -> int:
