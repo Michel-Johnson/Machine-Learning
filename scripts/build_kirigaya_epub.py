@@ -177,7 +177,12 @@ def collection_name(value) -> str:
     return ""
 
 
-def list_public_posts() -> tuple[list[dict], int]:
+def list_public_posts(cache_dir: Path) -> tuple[list[dict], int]:
+    cache_file = cache_dir / "post-list.json"
+    if cache_file.exists():
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        print(f"loaded post list from cache: {len(cached['posts'])}", flush=True)
+        return cached["posts"], int(cached["private_count"])
     posts: list[dict] = []
     seen: set[int] = set()
     private_count = 0
@@ -213,6 +218,11 @@ def list_public_posts() -> tuple[list[dict], int]:
             break
         page += 1
     posts.sort(key=lambda item: (parse_time(item["adjustTime"]), item["seq"]), reverse=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(
+        json.dumps({"posts": posts, "private_count": private_count}, ensure_ascii=False),
+        encoding="utf-8",
+    )
     return posts, private_count
 
 
@@ -391,7 +401,7 @@ def is_image_href(href: str) -> bool:
     return bool(IMAGE_EXT_RE.search(path))
 
 
-def prepare_soup(article: dict, available_seqs: set[int]) -> BeautifulSoup:
+def prepare_soup(article: dict) -> BeautifulSoup:
     soup = markdown_to_soup(article.get("markdown") or "")
     root = soup.find(id="root")
     assert root is not None
@@ -405,10 +415,6 @@ def prepare_soup(article: dict, available_seqs: set[int]) -> BeautifulSoup:
     for anchor in list(root.find_all("a")):
         href = normalize_url(anchor.get("href"))
         if not href or href.startswith("data:"):
-            continue
-        match = SEQ_LINK_RE.search(href)
-        if match and int(match.group(1)) in available_seqs:
-            anchor["href"] = f"p{match.group(1)}.xhtml"
             continue
         if anchor.find("img") is None and is_image_href(href):
             text = anchor.get_text(strip=True)
@@ -519,14 +525,27 @@ def save_jpeg(image: Image.Image, quality: int) -> bytes:
     return buffer.getvalue()
 
 
+def quantize_png(image: Image.Image, colors: int) -> bytes:
+    reduced = image.convert("RGB").quantize(colors=colors, method=Image.Quantize.FASTOCTREE)
+    buffer = io.BytesIO()
+    reduced.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
 def encode_image(data: bytes, kind: str, profile: str) -> tuple[bytes, str, str] | None:
-    """Return bytes, extension, media type. None if the payload is not an image."""
-    max_edge = 2400 if profile == "faithful" else 1600
-    jpeg_q = 92 if profile == "faithful" else 82
-    passthrough = 900_000 if profile == "faithful" else 0
+    """Return bytes, extension, media type. None if the payload is not an image.
+
+    WebP is transcoded because many EPUB readers will not paint it. Screenshots
+    and diagrams are stored as a quantized PNG so text stays sharp. Photos are
+    stored as JPEG. Small originals are kept byte-for-byte.
+    """
+    max_edge = 1800 if profile == "faithful" else 1400
+    jpeg_q = 84 if profile == "faithful" else 75
+    palette = 192 if profile == "faithful" else 128
+    passthrough = 280_000 if profile == "faithful" else 0
 
     if kind == "svg":
-        if b"<svg" not in data[:500].lower() and b"<svg" not in data[:500]:
+        if b"<svg" not in data[:800].lower() and not data.lstrip()[:200].startswith(b"<svg"):
             return None
         if len(data) > 2_000_000:
             return None
@@ -536,13 +555,9 @@ def encode_image(data: bytes, kind: str, profile: str) -> tuple[bytes, str, str]
         image = Image.open(io.BytesIO(data))
         image.load()
     except Exception:
-        if kind in {"jpeg", "png", "gif"} and len(data) < passthrough:
-            media = {"jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif"}[kind]
-            ext = "jpg" if kind == "jpeg" else kind
-            return data, ext, media
         return None
 
-    if getattr(image, "is_animated", False) and kind == "gif":
+    if getattr(image, "is_animated", False) and kind == "gif" and len(data) <= 1_500_000:
         return data, "gif", "image/gif"
 
     if (
@@ -565,13 +580,14 @@ def encode_image(data: bytes, kind: str, profile: str) -> tuple[bytes, str, str]
         image = image.convert("RGB")
 
     image = resize_max(image, max_edge)
-    png = save_png(image)
     jpeg = save_jpeg(image, jpeg_q)
-    if looks_like_diagram(image) and len(png) <= (2_500_000 if profile == "faithful" else 1_200_000):
-        return png, "png", "image/png"
-    if len(jpeg) <= len(png):
+    quantized = quantize_png(image, palette)
+    if looks_like_diagram(image) or len(quantized) + 40_000 < len(jpeg):
+        if len(quantized) <= len(jpeg) * 1.4:
+            return quantized, "png", "image/png"
+    if len(jpeg) <= len(quantized):
         return jpeg, "jpg", "image/jpeg"
-    return png, "png", "image/png"
+    return quantized, "png", "image/png"
 
 
 def image_cache_path(cache_dir: Path, url: str) -> Path:
@@ -710,6 +726,16 @@ def apply_images(soup: BeautifulSoup, article: dict, encoded: dict[str, dict], e
 
     inner = root.decode_contents()
     return ILLEGAL_XML_RE.sub("", inner)
+
+
+def localize_links(document: str, seqs: set[int]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        seq = int(match.group(1))
+        if seq in seqs:
+            return f"p{seq}.xhtml"
+        return match.group(0)
+
+    return SEQ_LINK_RE.sub(replace, document)
 
 
 def chapter_html(article: dict, body_html: str) -> str:
@@ -857,7 +883,10 @@ def build_book(
             file_name=f"p{article['seq']}.xhtml",
             lang="zh",
         )
-        chapter.content = chapter_html(article, bodies[article["seq"]])
+        chapter.content = localize_links(
+            chapter_html(article, bodies[article["seq"]]),
+            {item["seq"] for item in articles},
+        )
         chapter.add_item(style)
         book.add_item(chapter)
         chapters.append(chapter)
@@ -934,11 +963,32 @@ def split_articles(
     return groups
 
 
+def _zip_target(doc_name: str, src: str) -> str:
+    base = doc_name.rsplit("/", 1)[0]
+    parts = base.split("/") + src.split("/")
+    stack: list[str] = []
+    for part in parts:
+        if part == "..":
+            if stack:
+                stack.pop()
+        elif part and part != ".":
+            stack.append(part)
+    return "/".join(stack)
+
+
 def verify_epub(path: Path) -> dict:
-    report = {"path": str(path), "chapters": 0, "images": 0, "remote_imgs": 0, "broken_refs": 0, "unreadable": 0}
+    report = {
+        "path": str(path),
+        "chapters": 0,
+        "images": 0,
+        "remote_imgs": 0,
+        "broken_refs": 0,
+        "unreadable": 0,
+        "chapters_with_images": 0,
+    }
     with zipfile.ZipFile(path) as archive:
         names = set(archive.namelist())
-        image_names = [name for name in names if name.startswith("images/")]
+        image_names = [name for name in names if "/images/" in name or name.startswith("images/")]
         report["images"] = len(image_names)
         for name in image_names:
             data = archive.read(name)
@@ -952,17 +1002,22 @@ def verify_epub(path: Path) -> dict:
             except Exception:
                 report["unreadable"] += 1
         for name in names:
-            if not name.endswith(".xhtml") or name in {"nav.xhtml", "cover.xhtml"}:
-                continue
-            if name == "preface.xhtml":
+            if not re.search(r"/p\d+\.xhtml$", name) and not re.fullmatch(r"p\d+\.xhtml", name):
                 continue
             report["chapters"] += 1
             text = archive.read(name).decode("utf-8", errors="replace")
+            local_images = 0
             for src in re.findall(r"""<img[^>]+src=['"]([^'"]+)['"]""", text):
                 if src.startswith(("http://", "https://")):
                     report["remote_imgs"] += 1
-                elif src not in names and not src.startswith("data:"):
+                elif src.startswith("data:"):
+                    local_images += 1
+                elif _zip_target(name, src) not in names:
                     report["broken_refs"] += 1
+                else:
+                    local_images += 1
+            if local_images:
+                report["chapters_with_images"] += 1
     report["bytes"] = path.stat().st_size
     return report
 
@@ -975,18 +1030,17 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
 
-    posts, private_count = list_public_posts()
+    posts, private_count = list_public_posts(args.cache)
     if args.limit:
         posts = posts[: args.limit]
     articles, failures = fetch_articles(posts, args.cache, args.workers)
-    available = {article["seq"] for article in articles}
     print(f"ready {len(articles)} articles, private skipped about {private_count}", flush=True)
 
     soups = {}
     all_urls: list[str] = []
     urls_by_seq: dict[int, list[str]] = {}
     for article in articles:
-        soup = prepare_soup(article, available)
+        soup = prepare_soup(article)
         soups[article["seq"]] = soup
         cover = normalize_url(article.get("imgUrl"))
         urls = iter_image_urls(soup, cover)
